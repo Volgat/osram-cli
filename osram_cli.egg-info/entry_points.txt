@@ -1,2 +1,2 @@
 [console_scripts]
-osram = osram_cli.__main__:cli
+osram = osram_cli.__main__:main

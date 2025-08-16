@@ -1,8 +1,12 @@
 import os
 import json
 import sqlite3
+import re
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional
+from rich.console import Console
+
+console = Console()
 
 def load_config() -> Dict[str, Any]:
     """Load configuration from file"""
@@ -112,18 +116,25 @@ def load_config() -> Dict[str, Any]:
         
         return config
     except Exception as e:
-        print(f"Error loading configuration: {str(e)}")
+        console.print(f"[red]Error loading configuration: {str(e)}[/red]")
         return {}
 
 def save_config(config: Dict[str, Any]) -> bool:
     """Save configuration to file"""
     config_path = Path.home() / ".osram_config.json"
     try:
+        config_path.parent.mkdir(exist_ok=True)
+        
+        # Write config file
         with open(config_path, 'w') as f:
             json.dump(config, f, indent=2)
+        
+        # Set secure permissions (read/write for owner only)
+        os.chmod(config_path, 0o600)
+        
         return True
     except Exception as e:
-        print(f"Error saving configuration: {str(e)}")
+        console.print(f"[red]Error saving configuration: {str(e)}[/red]")
         return False
 
 def setup_database():
@@ -166,3 +177,29 @@ def setup_database():
     
     conn.commit()
     conn.close()
+
+def get_current_provider():
+    """Get current provider configuration"""
+    config = load_config()
+    provider_name = config.get("current_provider", "zai")
+    return provider_name, config["providers"].get(provider_name, {})
+
+def estimate_tokens(text):
+    """Estimate the number of tokens in a text"""
+    return len(text) // 4 + (1 if len(text) % 4 > 0 else 0)
+
+def validate_model(provider_name: str, model_name: str) -> bool:
+    """Validate if a model is available for a provider"""
+    from .providers import AVAILABLE_MODELS
+    
+    if provider_name not in AVAILABLE_MODELS:
+        return False
+    return model_name in AVAILABLE_MODELS[provider_name]
+
+def get_available_models(provider_name: str) -> List[str]:
+    """Return the list of available models for a provider"""
+    from .providers import AVAILABLE_MODELS
+    
+    if provider_name in AVAILABLE_MODELS:
+        return AVAILABLE_MODELS[provider_name]
+    return []

@@ -1,25 +1,21 @@
 #!/usr/bin/env python
-import click
-import requests
 import os
 import json
-import time
-import threading
-import sys
+import re
+import hashlib
+import subprocess
 import shutil
 import glob
-import re
-import subprocess
-import hashlib
-import sqlite3
-import socket
-import platform
 import uuid
+import sqlite3
+import platform
+import socket
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Tuple, Any, Generator
+from dataclasses import dataclass
 from enum import Enum
+
 # Rich imports for UI
 from rich.console import Console
 from rich.panel import Panel
@@ -43,22 +39,23 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.auto_suggest import AutoSuggestFromHistory
 from prompt_toolkit.completion import PathCompleter, WordCompleter
+
 # Import local modules
-from .providers import PROVIDERS
+from .providers import PROVIDERS, call_api, AVAILABLE_MODELS
 from .utils import load_config, save_config, setup_database
 
 # Initialize console
 console = Console()
 
-# Logo ASCII for Osram  adaptability
+# Logo ASCII for Osram
 LOGO = """
-    ..........................................................................................................
+..........................................................................................................
 ..........................................................................................................
 .........................................-+#%%%#=:......:-*%%%#+-.........................................
 .......................................-#%%%%%%%%%+:...+%%%%%%%%%#-.......................................
 ......................................-%%%#-:::+%%%+..+%%%*-::-#%%%-......................................
 ......................................*%%#:.....+%%#:.#%%+.....:#%%#......................................
-......................................*%%%-.....-%%%:.#%%=.....-%%%*......................................
+......................................*%%%-.....-%%%:.%%%=.....-%%%*......................................
 .......................................#%%%%#=..=%%%:.%%%=..=#%%%%#.......................................
 ........................................=*%%%=..=%%%==%%%+..=%%%*=........................................
 .............................................-+#%%%%%%%%%%#*-.............................................
@@ -99,6 +96,32 @@ LOGO = """
    
 """
 
+# Global variables
+current_directory = os.getcwd()
+file_operation_results = {}
+analysis_state = {
+    "current_task": None,
+    "subtasks": [],
+    "completed_files": [],
+    "errors": [],
+    "project_analysis": None
+}
+user_session = {
+    "session_id": str(uuid.uuid4()),
+    "start_time": datetime.now(),
+    "operations_count": 0,
+    "errors_count": 0,
+    "total_tokens_used": 0,
+    "actions_performed": [],
+    "trusted_directories": set()
+}
+token_usage = {
+    "total_tokens": 0,
+    "operations": []
+}
+navigation_history = []
+history_index = -1
+
 # Data classes for structured data
 @dataclass
 class FileOperation:
@@ -119,7 +142,7 @@ class ProjectAnalysis:
     structure: Dict[str, Any]
     quality_metrics: Dict[str, float]
     suggestions: List[str]
-    
+
 @dataclass
 class UserPreferences:
     theme: str = "dark"
@@ -153,87 +176,6 @@ class AnalysisType(Enum):
     DOCUMENTATION = "documentation"
     TESTS = "tests"
 
-# List of available models per provider
-AVAILABLE_MODELS = {
-    "zai": [
-        "GLM-4.5",
-        "GLM-4-Plus",
-        "GLM-4.5-X",
-        "GLM-4.5-Air",
-        "GLM-4.5-AirX",
-        "GLM-4.5-Flash",
-        "GLM-4-32B-0414-128K",
-        "ViduQ1-text",
-        "viduq1-image",
-        "viduq1-start-end",
-        "vidu2-image",
-        "vidu2-start-end",
-        "vidu2-reference",
-        "CogVideoX-3",
-        "GLM-4.5V",
-        "Vidu 2"
-    ],
-    "claude": [
-        "claude-3-opus-20240229",
-        "claude-3-sonnet-20240229",
-        "claude-3-haiku-20240307",
-        "claude-sonnet-4-20250514",
-        "claude-opus-4-1-20250805",
-        "claude-opus-4-20250214",
-        "claude-3-7-sonnet-20250219",
-        "claude-3-5-sonnet-20241022",
-        "claude-3-5-haiku-20241022"
-    ],
-    "gemini": [
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-latest",
-        "gemini-1.0-pro-latest",
-        "gemini-2.5-flash",
-        "gemini-2.5-pro"
-    ],
-    "openai": [
-        "gpt-4-turbo",
-        "gpt-4",
-        "gpt-3.5-turbo",
-        "gpt-4o",
-        "gpt-4o-mini",
-        "gpt-o3-2025-04-16",
-        "gpt-5-2025-08-07"
-    ],
-    "qwen": [
-        "Qwen3-Coder",
-        "Qwen3-235B-A22B",
-        "Qwen3-30B-A3B",
-        "Qwen2.5-Max",
-        "Qwen3-Coder-Flash",
-        "Qwen2.5-Plus",
-        "Qwen2.5-Turbo",
-        "QVQ-Max",
-        "Qwen2.5-Omni-7B",
-        "qwen-turbo",
-        "qwen-plus",
-        "qwen-max",
-        "qwen-max-longcontext"
-    ]
-}
-
-# Global variables
-current_directory = os.getcwd()
-file_operation_results = {}
-analysis_state = {
-    "current_task": None,
-    "subtasks": [],
-    "completed_files": [],
-    "errors": [],
-    "project_analysis": None
-}
-user_session = {
-    "session_id": str(uuid.uuid4()),
-    "start_time": datetime.now(),
-    "operations_count": 0,
-    "errors_count": 0
-}
-
 # Initialize database on import
 setup_database()
 
@@ -243,115 +185,470 @@ style = Style.from_dict({
     'bottom-toolbar': 'reverse',
 })
 
-# Configuration management functions
-def get_current_provider():
-    """Get current provider configuration"""
-    config = load_config()
-    provider_name = config.get("current_provider", "zai")
-    return provider_name, config["providers"].get(provider_name, {})
+def main():
+    """Main function to start the Osram CLI assistant"""
+    # Display welcome screen
+    display_welcome_screen()
+    
+    # Start chat session
+    start_chat_session()
 
-def switch_provider(provider_name=None, model_name=None):
-    """Switch to a different provider or model"""
-    config = load_config()
+def display_welcome_screen():
+    """Display welcome screen with directory information"""
+    console.print(LOGO)
     
-    if provider_name:
-        if provider_name not in config["providers"]:
-            console.print(f"[red]Provider '{provider_name}' not configured[/red]")
-            return False
-        
-        config["current_provider"] = provider_name
-        console.print(f"[green]Switched to provider: {provider_name}[/green]")
+    # Get current directory
+    current_dir = os.getcwd()
+    home_dir = str(Path.home())
     
-    if model_name:
-        current_provider = config.get("current_provider", "zai")
-        if current_provider not in config["providers"]:
-            console.print(f"[red]Current provider '{current_provider}' not configured[/red]")
-            return False
-        
-        # Validate model exists for this provider
-        if current_provider in AVAILABLE_MODELS and model_name not in AVAILABLE_MODELS[current_provider]:
-            console.print(f"[red]Model '{model_name}' not available for provider '{current_provider}'[/red]")
-            console.print(f"[yellow]Available models for {current_provider}: {', '.join(AVAILABLE_MODELS[current_provider])}[/yellow]")
-            return False
-        
-        config["providers"][current_provider]["model"] = model_name
-        console.print(f"[green]Switched to model: {model_name}[/green]")
+    # Shorten home directory path for display
+    if current_dir.startswith(home_dir):
+        display_dir = "~" + current_dir[len(home_dir):]
+    else:
+        display_dir = current_dir
     
-    return save_config(config)
+    # Create welcome panel
+    welcome_text = f"""
+[bold green]Welcome to Osram CLI![/bold green]
 
-def list_providers():
-    """List all configured providers"""
+Current directory: [bold blue]{display_dir}[/bold blue]
+
+Type your requests in natural language. For example:
+- "List the files in this directory"
+- "Read the README.md file"
+- "Create a new Python file"
+- "Analyze this project"
+
+Type [bold]/help[/bold] for help or [bold]/exit[/bold] to quit.
+"""
+    
+    console.print(Panel(welcome_text, title="Osram CLI", border_style="green"))
+
+def start_chat_session():
+    """Start the chat session with the AI assistant"""
+    # Load configuration
     config = load_config()
     current_provider = config.get("current_provider", "zai")
     
-    table = Table(title="AI Providers")
-    table.add_column("Provider", style="cyan", no_wrap=True)
-    table.add_column("Model", style="magenta")
-    table.add_column("Status", style="green")
+    # Check if API key is configured
+    if not config["providers"][current_provider].get("api_key"):
+        console.print(f"[yellow]No API key configured for provider '{current_provider}'.[/yellow]")
+        if Confirm.ask("[yellow]Would you like to configure it now?[/yellow]"):
+            configure_provider()
+            config = load_config()
+            current_provider = config.get("current_provider", "zai")
+        else:
+            console.print("[red]Please configure an API key to use the AI assistant.[/red]")
+            return
     
-    for name, provider in config["providers"].items():
-        status = "Current" if name == current_provider else "Available"
-        api_key_status = "✓ Configured" if provider.get("api_key") else "✗ Missing API key"
-        table.add_row(name, provider.get("model", "Not set"), f"{status} - {api_key_status}")
+    # Initialize chat history
+    history_file = Path.home() / ".osram_chat_history"
+    history = FileHistory(str(history_file))
+    
+    # Key bindings
+    bindings = KeyBindings()
+    
+    @bindings.add('c-q')
+    def _(event):
+        event.app.exit()
+    
+    # System prompt
+    system_prompt = """You are Osram CLI, an AI assistant that helps developers with their tasks. 
+    You can perform file operations, run commands, analyze projects, and more.
+    When the user asks you to do something, you should:
+    
+    1. Determine what action needs to be taken
+    2. Execute that action using the available tools
+    3. Provide a helpful response based on the results
+    
+    Available tools:
+    - List files in a directory
+    - Read file contents
+    - Write to files
+    - Create directories
+    - Delete files or directories
+    - Copy or move files
+    - Find files matching patterns
+    - Compare files
+    - Change directory
+    - Execute system commands
+    - Run git operations
+    - Analyze projects
+    - Execute code
+    
+    Always show the user what you're doing and provide clear results.
+    If you need to execute code, do it safely and show the results.
+    
+    If the user types "/help", provide information about available commands.
+    If the user types "/exit", end the session.
+    If the user types "/settings", show current settings.
+    If the user types "/tokens", show token usage.
+    If the user types "/configure", allow changing provider settings.
+    """
+    
+    # Initialize conversation with system prompt
+    messages = [{"role": "system", "content": system_prompt}]
+    
+    while True:
+        try:
+            # Get user input with current directory display
+            user_input = prompt(
+                get_prompt_with_directory(current_provider),
+                history=history,
+                auto_suggest=AutoSuggestFromHistory(),
+                style=style,
+                key_bindings=bindings
+            )
+            
+            # Check for special commands
+            if user_input.lower() == "/exit":
+                console.print("[bold green]Session ended. Goodbye![/bold green]")
+                break
+            elif user_input.lower() == "/help":
+                show_help()
+                continue
+            elif user_input.lower() == "/settings":
+                show_settings()
+                continue
+            elif user_input.lower() == "/tokens":
+                display_token_usage()
+                continue
+            elif user_input.lower() == "/configure":
+                configure_provider()
+                continue
+            
+            # Add user message to conversation
+            messages.append({"role": "user", "content": user_input})
+            
+            # Process user input and get response
+            response = process_user_input_with_ai(user_input, messages, current_provider)
+            
+            # Add AI response to conversation
+            messages.append({"role": "assistant", "content": response})
+            
+            # Display response
+            console.print(f"[bold green]AI ({current_provider}):[/bold green]")
+            console.print(response)
+            
+            # Track token usage
+            track_tokens("chat", estimate_tokens(user_input + response))
+            
+        except KeyboardInterrupt:
+            console.print("\n[bold yellow]Use /exit to quit.[/bold yellow]")
+        except EOFError:
+            console.print("\n[bold green]Session ended. Goodbye![/bold green]")
+            break
+
+def show_help():
+    """Show help information"""
+    help_text = """
+[bold]Available Commands:[/bold]
+
+- [bold]/help[/bold] - Show this help message
+- [bold]/exit[/bold] - Exit the session
+- [bold]/settings[/bold] - Show current settings
+- [bold]/tokens[/bold] - Display token usage
+- [bold]/configure[/bold] - Configure provider settings
+
+[bold]Examples of what you can ask:[/bold]
+
+- "List the files in this directory"
+- "Read the README.md file"
+- "Create a new Python file called app.py"
+- "Analyze this project"
+- "Run the command 'python app.py'"
+- "Find all Python files in this directory"
+- "Show me the directory structure"
+"""
+    console.print(Panel(help_text, title="Help", border_style="blue"))
+
+def show_settings():
+    """Show current settings"""
+    config = load_config()
+    current_provider = config.get("current_provider", "zai")
+    
+    table = Table(title="Current Settings")
+    table.add_column("Setting", style="cyan")
+    table.add_column("Value", style="magenta")
+    
+    table.add_row("Current Provider", current_provider)
+    table.add_row("Current Model", config["providers"][current_provider].get("model", "Not set"))
+    table.add_row("API Key Configured", "Yes" if config["providers"][current_provider].get("api_key") else "No")
+    table.add_row("Theme", config["user_preferences"].get("theme", "dark"))
+    table.add_row("Font Size", str(config["user_preferences"].get("font_size", 14)))
+    table.add_row("Auto Save", str(config["user_preferences"].get("auto_save", True)))
+    table.add_row("Confirm Destructive", str(config["user_preferences"].get("confirm_destructive", True)))
+    table.add_row("Streaming", str(config["user_preferences"].get("streaming", True)))
+    table.add_row("Max History", str(config["user_preferences"].get("max_history", 1000)))
     
     console.print(table)
 
-# API call function with provider support
-def call_api(messages, provider_name=None, model_name=None, temperature=None, max_tokens=None):
-    """Call AI API with the specified provider"""
+def configure_provider():
+    """Configure provider settings with connection test"""
+    console.print("[bold]Configure Provider Settings[/bold]")
+    
     config = load_config()
     
-    # Use specified provider or current provider
-    provider_name = provider_name or config.get("current_provider", "zai")
+    # List available providers
+    console.print("\n[bold]Available providers:[/bold]")
+    for i, provider in enumerate(config["providers"].keys(), 1):
+        current_marker = " (current)" if provider == config.get("current_provider") else ""
+        console.print(f"{i}. {provider}{current_marker}")
     
-    if provider_name not in config["providers"]:
-        console.print(f"[red]Provider '{provider_name}' not configured[/red]")
-        return None
+    # Get provider choice
+    provider_choice = Prompt.ask("Select a provider", choices=list(config["providers"].keys()))
     
-    provider_config = config["providers"][provider_name].copy()
+    # Get API key
+    api_key = Prompt.ask(f"Enter API key for {provider_choice}", password=True)
     
-    # Override model if specified
-    if model_name:
-        provider_config["model"] = model_name
+    # Update config
+    config["providers"][provider_choice]["api_key"] = api_key
+    config["current_provider"] = provider_choice
     
-    # Get provider class
-    provider_class = PROVIDERS.get(provider_name)
-    if not provider_class:
-        console.print(f"[red]Provider '{provider_name}' not implemented[/red]")
-        return None
-    
-    # Create provider instance
-    provider = provider_class(provider_config)
-    
-    # Format endpoint with variables if needed
-    endpoint = provider.endpoint.format(
-        model=provider.model,
-        api_key=provider.api_key
-    )
-    
-    try:
-        response = requests.post(
-            endpoint,
-            headers=provider.prepare_headers(),
-            json=provider.prepare_body(messages),
-            stream=True
-        )
-        response.raise_for_status()
+    # List available models for the provider
+    if provider_choice in AVAILABLE_MODELS:
+        console.print(f"\n[bold]Available models for {provider_choice}:[/bold]")
+        for model in AVAILABLE_MODELS[provider_choice]:
+            console.print(f"- {model}")
         
-        # Return the streaming response
-        return provider.parse_stream(response)
+        model_choice = Prompt.ask("Select a model", choices=AVAILABLE_MODELS[provider_choice])
+        config["providers"][provider_choice]["model"] = model_choice
+    
+    # Save config
+    if save_config(config):
+        console.print(f"[green]Configuration updated successfully![/green]")
         
-    except requests.exceptions.RequestException as e:
-        console.print(f"[red]API Error: {str(e)}[/red]")
-        return None
+        # Test the connection
+        console.print("[yellow]Testing connection...[/yellow]")
+        test_messages = [{"role": "user", "content": "Hello, this is a test message."}]
+        response_stream = call_api(test_messages, provider_name=provider_choice)
+        
+        if response_stream:
+            console.print("[green]Connection test successful![/green]")
+        else:
+            console.print("[red]Connection test failed. Please check your API key.[/red]")
+    else:
+        console.print("[red]Failed to update configuration.[/red]")
 
-# File operation functions with enhanced error handling
-def list_directory_contents(path="."):
-    """List contents of a directory with details"""
-    global file_operation_results
+def get_prompt_with_directory(provider):
+    """Get prompt with current directory displayed"""
+    current_dir = get_current_directory()
+    # Shorten home directory path
+    home = str(Path.home())
+    if current_dir.startswith(home):
+        display_dir = "~" + current_dir[len(home):]
+    else:
+        display_dir = current_dir
     
+    return HTML(f"<ansiblue>You</ansiblue> ({provider}) <ansigreen>{display_dir}</ansigreen>: ")
+
+def process_user_input_with_ai(user_input: str, messages: List[Dict[str, str]], current_provider: str) -> str:
+    """Process user input with AI assistance and robust error handling"""
+    # First, let the AI analyze the user's request
+    analysis_prompt = f"""
+    Analyze the user's request and determine what action needs to be taken:
+    
+    User request: {user_input}
+    
+    Respond with a JSON object containing:
+    {{
+        "action_type": "list_files|read_file|write_file|create_directory|delete_file|copy_file|move_file|find_files|compare_files|change_directory|run_command|git_operation|analyze_project|execute_code|none",
+        "parameters": {{
+            // Parameters specific to the action type
+        }},
+        "requires_ai_response": true/false,
+        "is_destructive": true/false
+    }}
+    """
+    
+    # Add analysis prompt to messages
+    analysis_messages = messages + [{"role": "system", "content": analysis_prompt}]
+    
+    # Get AI analysis
     try:
-        path = os.path.normpath(path)
+        response_stream = call_api(analysis_messages, provider_name=current_provider)
+        
+        if response_stream is None:
+            return "I'm sorry, I'm having trouble connecting to the AI service. Please check your API key and try again."
+        
+        analysis_response = ""
+        for chunk in response_stream:
+            analysis_response += chunk
+        
+        # If we didn't get a proper response, return an error message
+        if not analysis_response.strip():
+            return "I'm sorry, I received an empty response from the AI service. Please try again."
+        
+        # Parse JSON response
+        try:
+            action_data = json.loads(analysis_response)
+            action_type = action_data.get("action_type")
+            parameters = action_data.get("parameters", {})
+            requires_ai_response = action_data.get("requires_ai_response", True)
+            is_destructive = action_data.get("is_destructive", False)
+            
+            # Ask for confirmation if the action is destructive
+            if is_destructive:
+                config = load_config()
+                if config["user_preferences"].get("confirm_destructive", True):
+                    if not Confirm.ask(f"[red]This action may modify or delete files. Are you sure you want to continue?[/red]"):
+                        return "Action cancelled by user."
+            
+            # Execute the action
+            result = execute_action(action_type, parameters)
+            
+            # If AI response is required, get it
+            if requires_ai_response:
+                response_prompt = f"""
+                Based on the user's request and the action result, provide a helpful response:
+                
+                User request: {user_input}
+                Action result: {result}
+                """
+                
+                try:
+                    response_messages = messages + [{"role": "system", "content": response_prompt}]
+                    response_stream = call_api(response_messages, provider_name=current_provider)
+                    
+                    if response_stream is None:
+                        return f"Action completed: {result}\n\nHowever, I'm having trouble generating a detailed response."
+                    
+                    ai_response = ""
+                    for chunk in response_stream:
+                        ai_response += chunk
+                    
+                    return ai_response
+                except Exception as e:
+                    return f"Action completed: {result}\n\nHowever, I encountered an error while generating a detailed response: {str(e)}"
+            else:
+                return f"Action completed: {result}"
+                
+        except json.JSONDecodeError as e:
+            # If JSON parsing fails, try to get a regular response
+            try:
+                response_stream = call_api(messages, provider_name=current_provider)
+                
+                if response_stream is None:
+                    return "I'm sorry, I'm having trouble connecting to the AI service. Please check your API key and try again."
+                
+                response = ""
+                for chunk in response_stream:
+                    response += chunk
+                
+                return response
+            except Exception as e:
+                return f"I'm sorry, I encountered an error while processing your request: {str(e)}"
+                
+    except Exception as e:
+        return f"I'm sorry, I encountered an error while processing your request: {str(e)}"
+
+def execute_action(action_type: str, parameters: Dict[str, Any]) -> str:
+    """Execute the specified action with given parameters"""
+    if action_type == "list_files":
+        path = parameters.get("path", ".")
+        return list_directory_contents_real(path)
+    
+    elif action_type == "read_file":
+        file_path = parameters.get("file_path")
+        if file_path:
+            return read_file_content_real(file_path)
+        else:
+            return "Error: No file path specified."
+    
+    elif action_type == "write_file":
+        file_path = parameters.get("file_path")
+        content = parameters.get("content", "")
+        if file_path:
+            return write_file_content(file_path, content)
+        else:
+            return "Error: No file path specified."
+    
+    elif action_type == "create_directory":
+        dir_path = parameters.get("dir_path")
+        if dir_path:
+            return create_directory(dir_path)
+        else:
+            return "Error: No directory path specified."
+    
+    elif action_type == "delete_file":
+        path = parameters.get("path")
+        if path:
+            return delete_file_or_path(path)
+        else:
+            return "Error: No path specified."
+    
+    elif action_type == "copy_file":
+        source = parameters.get("source")
+        destination = parameters.get("destination")
+        if source and destination:
+            return copy_file(source, destination)
+        else:
+            return "Error: Both source and destination paths are required."
+    
+    elif action_type == "move_file":
+        source = parameters.get("source")
+        destination = parameters.get("destination")
+        if source and destination:
+            return move_file(source, destination)
+        else:
+            return "Error: Both source and destination paths are required."
+    
+    elif action_type == "find_files":
+        pattern = parameters.get("pattern")
+        directory = parameters.get("directory", ".")
+        if pattern:
+            return find_files(pattern, directory)
+        else:
+            return "Error: No search pattern specified."
+    
+    elif action_type == "compare_files":
+        file1 = parameters.get("file1")
+        file2 = parameters.get("file2")
+        if file1 and file2:
+            return compare_files(file1, file2)
+        else:
+            return "Error: Both file paths are required."
+    
+    elif action_type == "change_directory":
+        path = parameters.get("path")
+        if path:
+            return advanced_change_directory(path)
+        else:
+            return "Error: No directory path specified."
+    
+    elif action_type == "run_command":
+        command = parameters.get("command")
+        if command:
+            return execute_system_command(command)
+        else:
+            return "Error: No command specified."
+    
+    elif action_type == "git_operation":
+        operation = parameters.get("operation")
+        args = parameters.get("args", [])
+        if operation:
+            return git_operation(operation, *args)
+        else:
+            return "Error: No git operation specified."
+    
+    elif action_type == "analyze_project":
+        return analyze_project_real()
+    
+    elif action_type == "execute_code":
+        code = parameters.get("code")
+        if code:
+            return execute_code(code)
+        else:
+            return "Error: No code specified."
+    
+    else:
+        return "Error: Unknown action type."
+
+# File Operations Functions
+def list_directory_contents_real(path="."):
+    """List real directory contents"""
+    try:
+        path = os.path.abspath(path)
         
         if not os.path.exists(path):
             return f"Error: Path '{path}' does not exist."
@@ -367,7 +664,7 @@ def list_directory_contents(path="."):
             try:
                 stat = os.stat(item_path)
                 if os.path.isdir(item_path):
-                    result.append(f"📁 {item}/ (directory)")
+                    result.append(f"📁 {item}/")
                 else:
                     size = stat.st_size
                     modified = datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M")
@@ -375,19 +672,14 @@ def list_directory_contents(path="."):
             except Exception as e:
                 result.append(f"❌ {item} (error: {str(e)})")
         
-        file_operation_results["list_directory"] = "\n".join(result)
-        return file_operation_results["list_directory"]
+        return "\n".join(result)
     except Exception as e:
-        error_msg = f"Error listing directory: {str(e)}"
-        file_operation_results["list_directory"] = error_msg
-        return error_msg
+        return f"Error listing directory: {str(e)}"
 
-def read_file_content(file_path):
-    """Read content of a file with syntax detection"""
-    global file_operation_results
-    
+def read_file_content_real(file_path):
+    """Read file content"""
     try:
-        file_path = os.path.normpath(file_path)
+        file_path = os.path.abspath(file_path)
         
         if not os.path.exists(file_path):
             return f"Error: File '{file_path}' does not exist."
@@ -398,19 +690,18 @@ def read_file_content(file_path):
         with open(file_path, 'r', encoding='utf-8') as f:
             content = f.read()
         
-        file_operation_results["read_file"] = f"Content of file: {file_path}\n\n{content}"
-        return file_operation_results["read_file"]
+        return f"Content of file: {file_path}\n\n{content}"
     except Exception as e:
-        error_msg = f"Error reading file: {str(e)}"
-        file_operation_results["read_file"] = error_msg
-        return error_msg
+        return f"Error reading file: {str(e)}"
 
-def write_file_content(file_path, content):
-    """Write content to a file with backup"""
-    global file_operation_results
-    
+def write_file_content(file_path, content, auto_confirm=False):
+    """Write content to a file"""
     try:
-        file_path = os.path.normpath(file_path)
+        file_path = os.path.abspath(file_path)
+        
+        # Ask for confirmation if not auto-confirm
+        if not auto_confirm and not Confirm.ask(f"[yellow]Are you sure you want to write to {file_path}?[/yellow]"):
+            return "Operation cancelled by user."
         
         # Create backup if file exists
         if os.path.exists(file_path):
@@ -427,38 +718,35 @@ def write_file_content(file_path, content):
         if os.path.exists(f"{file_path}.bak"):
             result += f"\nBackup saved as: {file_path}.bak"
         
-        file_operation_results["write_file"] = result
         return result
     except Exception as e:
-        error_msg = f"Error writing file: {str(e)}"
-        file_operation_results["write_file"] = error_msg
-        return error_msg
+        return f"Error writing file: {str(e)}"
 
-def create_directory(dir_path):
+def create_directory(dir_path, auto_confirm=False):
     """Create a new directory"""
-    global file_operation_results
-    
     try:
-        dir_path = os.path.normpath(dir_path)
+        dir_path = os.path.abspath(dir_path)
+        
+        # Ask for confirmation if not auto-confirm
+        if not auto_confirm and not Confirm.ask(f"[yellow]Are you sure you want to create directory {dir_path}?[/yellow]"):
+            return "Operation cancelled by user."
         
         os.makedirs(dir_path, exist_ok=True)
-        result = f"Successfully created directory: {dir_path}"
-        file_operation_results["create_directory"] = result
-        return result
+        return f"Successfully created directory: {dir_path}"
     except Exception as e:
-        error_msg = f"Error creating directory: {str(e)}"
-        file_operation_results["create_directory"] = error_msg
-        return error_msg
+        return f"Error creating directory: {str(e)}"
 
-def delete_file_or_path(path):
-    """Delete a file or directory with confirmation"""
-    global file_operation_results
-    
+def delete_file_or_path(path, auto_confirm=False):
+    """Delete a file or directory"""
     try:
-        path = os.path.normpath(path)
+        path = os.path.abspath(path)
         
         if not os.path.exists(path):
             return f"Error: Path '{path}' does not exist."
+        
+        # Ask for confirmation if not auto-confirm
+        if not auto_confirm and not Confirm.ask(f"[red]Are you sure you want to delete {path}? This action cannot be undone.[/red]"):
+            return "Operation cancelled by user."
         
         # Move to trash instead of permanent delete
         trash_path = Path.home() / ".osram_cli" / "trash"
@@ -474,111 +762,76 @@ def delete_file_or_path(path):
         
         shutil.move(path, dest_path)
         
-        result = f"Moved to trash: {path} -> {dest_path}"
-        file_operation_results["delete_file"] = result
-        return result
+        return f"Moved to trash: {path} -> {dest_path}"
     except Exception as e:
-        error_msg = f"Error deleting path: {str(e)}"
-        file_operation_results["delete_file"] = error_msg
-        return error_msg
+        return f"Error deleting path: {str(e)}"
 
-def copy_file(source, destination):
+def copy_file(source, destination, auto_confirm=False):
     """Copy a file or directory"""
-    global file_operation_results
-    
     try:
-        source = os.path.normpath(source)
-        destination = os.path.normpath(destination)
+        source = os.path.abspath(source)
+        destination = os.path.abspath(destination)
         
         if not os.path.exists(source):
             return f"Error: Source '{source}' does not exist."
+        
+        # Ask for confirmation if not auto-confirm
+        if not auto_confirm and not Confirm.ask(f"[yellow]Are you sure you want to copy {source} to {destination}?[/yellow]"):
+            return "Operation cancelled by user."
         
         if os.path.isdir(source):
             shutil.copytree(source, destination)
         else:
             shutil.copy2(source, destination)
         
-        result = f"Successfully copied: {source} -> {destination}"
-        file_operation_results["copy_file"] = result
-        return result
+        return f"Successfully copied: {source} -> {destination}"
     except Exception as e:
-        error_msg = f"Error copying file: {str(e)}"
-        file_operation_results["copy_file"] = error_msg
-        return error_msg
+        return f"Error copying file: {str(e)}"
 
-def move_file(source, destination):
+def move_file(source, destination, auto_confirm=False):
     """Move a file or directory"""
-    global file_operation_results
-    
     try:
-        source = os.path.normpath(source)
-        destination = os.path.normpath(destination)
+        source = os.path.abspath(source)
+        destination = os.path.abspath(destination)
         
         if not os.path.exists(source):
             return f"Error: Source '{source}' does not exist."
         
+        # Ask for confirmation if not auto-confirm
+        if not auto_confirm and not Confirm.ask(f"[yellow]Are you sure you want to move {source} to {destination}?[/yellow]"):
+            return "Operation cancelled by user."
+        
         shutil.move(source, destination)
-        result = f"Successfully moved: {source} -> {destination}"
-        file_operation_results["move_file"] = result
-        return result
+        return f"Successfully moved: {source} -> {destination}"
     except Exception as e:
-        error_msg = f"Error moving file: {str(e)}"
-        file_operation_results["move_file"] = error_msg
-        return error_msg
-
-def rename_file(old_path, new_name):
-    """Rename a file or directory"""
-    global file_operation_results
-    
-    try:
-        old_path = os.path.normpath(old_path)
-        new_path = os.path.join(os.path.dirname(old_path), new_name)
-        
-        if not os.path.exists(old_path):
-            return f"Error: Path '{old_path}' does not exist."
-        
-        os.rename(old_path, new_path)
-        result = f"Successfully renamed: {old_path} -> {new_path}"
-        file_operation_results["rename_file"] = result
-        return result
-    except Exception as e:
-        error_msg = f"Error renaming file: {str(e)}"
-        file_operation_results["rename_file"] = error_msg
-        return error_msg
+        return f"Error moving file: {str(e)}"
 
 def find_files(pattern, directory="."):
     """Find files matching a pattern"""
-    global file_operation_results
-    
     try:
-        directory = os.path.normpath(directory)
+        directory = os.path.abspath(directory)
         
         matches = glob.glob(os.path.join(directory, pattern))
         if not matches:
-            result = f"No files found matching pattern: {pattern} in directory: {directory}"
-        else:
-            result = [f"Files matching pattern '{pattern}' in directory '{directory}':"]
-            for match in matches:
-                if os.path.isdir(match):
-                    result.append(f"📁 {match}/")
-                else:
-                    size = os.path.getsize(match)
-                    result.append(f"📄 {match} ({size} bytes)")
+            return f"No files found matching pattern: {pattern} in directory: {directory}"
         
-        file_operation_results["find_files"] = "\n".join(result)
-        return file_operation_results["find_files"]
+        result = [f"Files matching pattern '{pattern}' in directory '{directory}':"]
+        for match in matches:
+            if os.path.isdir(match):
+                result.append(f"📁 {match}/")
+            else:
+                size = os.path.getsize(match)
+                result.append(f"📄 {match} ({size} bytes)")
+        
+        return "\n".join(result)
     except Exception as e:
-        error_msg = f"Error finding files: {str(e)}"
-        file_operation_results["find_files"] = error_msg
-        return error_msg
+        return f"Error finding files: {str(e)}"
 
 def compare_files(file1, file2):
     """Compare two files"""
-    global file_operation_results
-    
     try:
-        file1 = os.path.normpath(file1)
-        file2 = os.path.normpath(file2)
+        file1 = os.path.abspath(file1)
+        file2 = os.path.abspath(file2)
         
         if not os.path.exists(file1):
             return f"Error: File '{file1}' does not exist."
@@ -606,23 +859,42 @@ def compare_files(file1, file2):
                 diff.append(f"Line {i+1} (only in File2): {content2[i].strip()}")
         
         if not diff:
-            result = "Files are identical"
-        else:
-            result = f"Differences between {file1} and {file2}:\n" + "\n".join(diff)
+            return "Files are identical"
         
-        file_operation_results["compare_files"] = result
-        return result
+        return f"Differences between {file1} and {file2}:\n" + "\n".join(diff)
     except Exception as e:
-        error_msg = f"Error comparing files: {str(e)}"
-        file_operation_results["compare_files"] = error_msg
-        return error_msg
+        return f"Error comparing files: {str(e)}"
+
+def advanced_change_directory(path):
+    """Advanced directory change with history"""
+    global current_directory, navigation_history, history_index
+    
+    path = os.path.abspath(path)
+    
+    if not os.path.exists(path):
+        return f"Error: Path '{path}' does not exist."
+    
+    if not os.path.isdir(path):
+        return f"Error: '{path}' is not a directory."
+    
+    # Update history
+    if history_index < len(navigation_history) - 1:
+        navigation_history = navigation_history[:history_index + 1]
+    
+    navigation_history.append(current_directory)
+    history_index = len(navigation_history)
+    
+    os.chdir(path)
+    current_directory = os.getcwd()
+    
+    return f"Changed directory to: {current_directory}"
 
 def change_directory(path):
     """Change current directory"""
-    global current_directory, file_operation_results
+    global current_directory
     
     try:
-        path = os.path.normpath(path)
+        path = os.path.abspath(path)
         
         if not os.path.exists(path):
             return f"Error: Path '{path}' does not exist."
@@ -632,36 +904,33 @@ def change_directory(path):
         
         os.chdir(path)
         current_directory = os.getcwd()
-        result = f"Changed directory to: {current_directory}"
-        file_operation_results["change_directory"] = result
-        return result
+        return f"Changed directory to: {current_directory}"
     except Exception as e:
-        error_msg = f"Error changing directory: {str(e)}"
-        file_operation_results["change_directory"] = error_msg
-        return error_msg
+        return f"Error changing directory: {str(e)}"
 
 def get_current_directory():
     """Get current directory"""
-    global current_directory, file_operation_results
-    
+    global current_directory
     current_directory = os.getcwd()
-    result = f"Current directory: {current_directory}"
-    file_operation_results["get_current_directory"] = result
-    return result
+    return f"Current directory: {current_directory}"
 
-def execute_shell_command(command):
-    """Execute shell command and return output"""
-    global file_operation_results
-    
+# System Operations Functions
+def execute_system_command(command, timeout=30):
+    """Execute system command and return output"""
     try:
+        # Log the command
+        console.print(f"[dim]Executing: {command}[/dim]")
+        
+        # Execute the command
         result = subprocess.run(
             command,
             shell=True,
             capture_output=True,
             text=True,
-            timeout=30
+            timeout=timeout
         )
         
+        # Prepare the output
         output = f"Command: {command}\n"
         output += f"Return code: {result.returncode}\n"
         
@@ -671,21 +940,14 @@ def execute_shell_command(command):
         if result.stderr:
             output += f"Stderr:\n{result.stderr}\n"
         
-        file_operation_results["shell_command"] = output
         return output
     except subprocess.TimeoutExpired:
-        error_msg = "Command timed out after 30 seconds"
-        file_operation_results["shell_command"] = error_msg
-        return error_msg
+        return f"Command timed out after {timeout} seconds"
     except Exception as e:
-        error_msg = f"Error executing command: {str(e)}"
-        file_operation_results["shell_command"] = error_msg
-        return error_msg
+        return f"Error executing command: {str(e)}"
 
 def git_operation(operation, *args):
     """Execute git operations"""
-    global file_operation_results
-    
     try:
         cmd = ["git", operation] + list(args)
         result = subprocess.run(
@@ -704,796 +966,95 @@ def git_operation(operation, *args):
         if result.stderr:
             output += f"Error:\n{result.stderr}\n"
         
-        file_operation_results["git_operation"] = output
         return output
     except subprocess.TimeoutExpired:
-        error_msg = "Git operation timed out after 60 seconds"
-        file_operation_results["git_operation"] = error_msg
-        return error_msg
+        return "Git operation timed out after 60 seconds"
     except Exception as e:
-        error_msg = f"Error executing git operation: {str(e)}"
-        file_operation_results["git_operation"] = error_msg
-        return error_msg
+        return f"Error executing git operation: {str(e)}"
 
-# Advanced analysis functions
-def analyze_project_structure(project_path):
-    """Analyze project structure"""
-    global analysis_state
+# Project Analysis Functions
+def analyze_project_real():
+    """Analyze the current directory project with real file access"""
+    current_dir = os.getcwd()
     
+    # Step 1: List directory contents
+    dir_contents = list_directory_contents_real(current_dir)
+    
+    # Step 2: Identify project type and key files
+    project_files = ['package.json', 'requirements.txt', 'setup.py', 'pom.xml', 'Cargo.toml', 'go.mod', '.git']
+    found_files = []
+    
+    for file in project_files:
+        if os.path.exists(os.path.join(current_dir, file)):
+            found_files.append(file)
+    
+    # Step 3: Read key files if they exist
+    file_contents = {}
+    for file in found_files:
+        file_path = os.path.join(current_dir, file)
+        file_contents[file] = read_file_content_real(file_path)
+    
+    # Step 4: Analyze source code files
+    source_files = []
+    for root, dirs, files in os.walk(current_dir):
+        # Skip hidden directories and common build directories
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', '.git', 'build', 'dist']]
+        
+        for file in files:
+            file_path = os.path.join(root, file)
+            # Check for common source file extensions
+            if file.endswith(('.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.cs', '.go', 'rs', '.rb', '.php', '.swift', '.kt', '.scala', '.html', '.css', '.json', '.xml', '.yaml', '.yml')):
+                source_files.append(file_path)
+    
+    # Step 5: Read a sample of source files for analysis
+    sample_files = source_files[:5]  # Limit to first 5 files for brevity
+    sample_contents = {}
+    for file_path in sample_files:
+        sample_contents[file_path] = read_file_content_real(file_path)
+    
+    # Update analysis state
+    analysis_state["current_task"] = "Project analysis completed"
+    analysis_state["completed_files"] = found_files + sample_files
+    
+    return f"Project analysis completed. Found {len(found_files)} project files and {len(source_files)} source files."
+
+def execute_code(code):
+    """Execute code and return the result"""
     try:
-        project_path = os.path.normpath(project_path)
-        
-        if not os.path.exists(project_path):
-            return f"Error: Project path '{project_path}' does not exist."
-        
-        if not os.path.isdir(project_path):
-            return f"Error: '{project_path}' is not a directory."
-        
-        # Initialize analysis
-        structure = {
-            "name": os.path.basename(project_path),
-            "path": project_path,
-            "files": [],
-            "directories": [],
-            "file_types": {},
-            "total_files": 0,
-            "total_size": 0
-        }
-        
-        # Walk through project directory
-        for root, dirs, files in os.walk(project_path):
-            # Skip hidden directories and common build directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', '.git', 'build', 'dist']]
-            
-            for file in files:
-                file_path = os.path.join(root, file)
-                
-                # Skip hidden files
-                if file.startswith('.'):
-                    continue
-                
-                try:
-                    stat = os.stat(file_path)
-                    file_ext = os.path.splitext(file)[1].lower()
-                    
-                    # Update file types count
-                    if file_ext:
-                        structure["file_types"][file_ext] = structure["file_types"].get(file_ext, 0) + 1
-                    else:
-                        structure["file_types"]["no_extension"] = structure["file_types"].get("no_extension", 0) + 1
-                    
-                    # Add file to structure
-                    rel_path = os.path.relpath(file_path, project_path)
-                    structure["files"].append({
-                        "path": rel_path,
-                        "size": stat.st_size,
-                        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    })
-                    
-                    # Update totals
-                    structure["total_files"] += 1
-                    structure["total_size"] += stat.st_size
-                    
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not analyze file {file_path}: {str(e)}[/yellow]")
-        
-        # Add directories
-        for root, dirs, files in os.walk(project_path):
-            # Skip hidden directories and common build directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', '.git', 'build', 'dist']]
-            
-            for dir_name in dirs:
-                dir_path = os.path.join(root, dir_name)
-                rel_path = os.path.relpath(dir_path, project_path)
-                
-                try:
-                    stat = os.stat(dir_path)
-                    structure["directories"].append({
-                        "path": rel_path,
-                        "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
-                    })
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not analyze directory {dir_path}: {str(e)}[/yellow]")
-        
-        # Update analysis state
-        analysis_state["project_analysis"] = ProjectAnalysis(
-            project_path=project_path,
-            files_analyzed=structure["files"],
-            dependencies={},
-            structure=structure,
-            quality_metrics={},
-            suggestions=[]
-        )
-        
-        return f"Analyzed project structure: {structure['total_files']} files, {len(structure['directories'])} directories"
-    
+        # For now, we'll just return a placeholder
+        # In a real implementation, this would execute the code in a safe environment
+        return f"Code execution result for:\n```\n{code}\n```\n\nThis is a placeholder. Code execution would be implemented in a secure environment."
     except Exception as e:
-        error_msg = f"Error analyzing project structure: {str(e)}"
-        console.print(f"[red]{error_msg}[/red]")
-        return error_msg
+        return f"Error executing code: {str(e)}"
 
-def analyze_project_dependencies(project_path):
-    """Analyze project dependencies"""
-    global analysis_state
+# Token Tracking Functions
+def track_tokens(operation_name: str, tokens_used: int):
+    """Track token usage for each operation"""
+    global token_usage
     
-    try:
-        project_path = os.path.normpath(project_path)
-        
-        if not os.path.exists(project_path):
-            return f"Error: Project path '{project_path}' does not exist."
-        
-        if not os.path.isdir(project_path):
-            return f"Error: '{project_path}' is not a directory."
-        
-        dependencies = {}
-        
-        # Check for package.json (Node.js)
-        package_json_path = os.path.join(project_path, "package.json")
-        if os.path.exists(package_json_path):
-            try:
-                with open(package_json_path, 'r') as f:
-                    package_json = json.load(f)
-                
-                if "dependencies" in package_json:
-                    dependencies["npm"] = list(package_json["dependencies"].keys())
-                
-                if "devDependencies" in package_json:
-                    if "npm" not in dependencies:
-                        dependencies["npm"] = []
-                    dependencies["npm"].extend(package_json["devDependencies"].keys())
-                
-                console.print("[green]Found Node.js dependencies[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not parse package.json: {str(e)}[/yellow]")
-        
-        # Check for requirements.txt (Python)
-        requirements_paths = [
-            os.path.join(project_path, "requirements.txt"),
-            os.path.join(project_path, "requirements", "base.txt"),
-            os.path.join(project_path, "requirements", "local.txt"),
-            os.path.join(project_path, "requirements", "production.txt")
-        ]
-        
-        for req_path in requirements_paths:
-            if os.path.exists(req_path):
-                try:
-                    with open(req_path, 'r') as f:
-                        requirements = f.read()
-                    
-                    # Parse requirements
-                    reqs = []
-                    for line in requirements.split('\n'):
-                        line = line.strip()
-                        if line and not line.startswith('#'):
-                            # Extract package name (remove version specifiers)
-                            pkg_name = re.split(r'[<>=!]', line)[0].strip()
-                            if pkg_name:
-                                reqs.append(pkg_name)
-                    
-                    if reqs:
-                        dependencies["pip"] = reqs
-                        console.print(f"[green]Found Python dependencies in {os.path.basename(req_path)}[/green]")
-                        break
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not parse {req_path}: {str(e)}[/yellow]")
-        
-        # Check for pom.xml (Maven/Java)
-        pom_path = os.path.join(project_path, "pom.xml")
-        if os.path.exists(pom_path):
-            try:
-                # Simple regex-based extraction (for a real implementation, use an XML parser)
-                with open(pom_path, 'r') as f:
-                    pom_content = f.read()
-                
-                # Extract dependencies
-                deps = re.findall(r'<dependency>.*?<groupId>(.*?)</groupId>.*?<artifactId>(.*?)</artifactId>.*?</dependency>', pom_content, re.DOTALL)
-                if deps:
-                    dependencies["maven"] = [f"{group_id}:{artifact_id}" for group_id, artifact_id in deps]
-                    console.print("[green]Found Maven dependencies[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not parse pom.xml: {str(e)}[/yellow]")
-        
-        # Check for build.gradle or build.gradle.kts (Gradle/Java/Kotlin)
-        for gradle_file in ["build.gradle", "build.gradle.kts"]:
-            gradle_path = os.path.join(project_path, gradle_file)
-            if os.path.exists(gradle_path):
-                try:
-                    with open(gradle_path, 'r') as f:
-                        gradle_content = f.read()
-                    
-                    # Extract dependencies (simplified)
-                    deps = re.findall(r'(?:implementation|api|compile|testImplementation)\s+[\"\']([^\"\']+)[\"\']', gradle_content)
-                    if deps:
-                        dependencies["gradle"] = deps
-                        console.print(f"[green]Found Gradle dependencies in {gradle_file}[/green]")
-                        break
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not parse {gradle_file}: {str(e)}[/yellow]")
-        
-        # Check for Cargo.toml (Rust)
-        cargo_path = os.path.join(project_path, "Cargo.toml")
-        if os.path.exists(cargo_path):
-            try:
-                with open(cargo_path, 'r') as f:
-                    cargo_content = f.read()
-                
-                # Extract dependencies
-                deps = re.findall(r'^(\w+)\s*=\s*[\"\']([^\"\']+)[\"\']', cargo_content, re.MULTILINE)
-                if deps:
-                    dependencies["cargo"] = [f"{name}={version}" for name, version in deps]
-                    console.print("[green]Found Cargo dependencies[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not parse Cargo.toml: {str(e)}[/yellow]")
-        
-        # Check for go.mod (Go)
-        go_mod_path = os.path.join(project_path, "go.mod")
-        if os.path.exists(go_mod_path):
-            try:
-                with open(go_mod_path, 'r') as f:
-                    go_mod_content = f.read()
-                
-                # Extract dependencies
-                deps = re.findall(r'^\s*(\S+)\s+\S+', go_mod_content, re.MULTILINE)
-                if deps:
-                    dependencies["go"] = deps
-                    console.print("[green]Found Go dependencies[/green]")
-            except Exception as e:
-                console.print(f"[yellow]Warning: Could not parse go.mod: {str(e)}[/yellow]")
-        
-        # Update analysis state
-        if analysis_state.get("project_analysis"):
-            analysis_state["project_analysis"].dependencies = dependencies
-        else:
-            analysis_state["project_analysis"] = ProjectAnalysis(
-                project_path=project_path,
-                files_analyzed=[],
-                dependencies=dependencies,
-                structure={},
-                quality_metrics={},
-                suggestions=[]
-            )
-        
-        return f"Analyzed project dependencies: {sum(len(deps) for deps in dependencies.values())} dependencies found"
+    token_usage["total_tokens"] += tokens_used
+    token_usage["operations"].append({
+        "operation": operation_name,
+        "tokens": tokens_used,
+        "timestamp": datetime.now().isoformat()
+    })
     
-    except Exception as e:
-        error_msg = f"Error analyzing project dependencies: {str(e)}"
-        console.print(f"[red]{error_msg}[/red]")
-        return error_msg
+    # Display token usage dynamically
+    console.print(f"[dim]Tokens used - {operation_name}: {tokens_used} (Total: {token_usage['total_tokens']})[/dim]")
 
-def analyze_code_quality(project_path):
-    """Analyze code quality metrics"""
-    global analysis_state
+def display_token_usage():
+    """Display a detailed token usage report"""
+    table = Table(title="Token Usage")
+    table.add_column("Operation", style="cyan")
+    table.add_column("Tokens", style="magenta")
+    table.add_column("Timestamp", style="green")
     
-    try:
-        project_path = os.path.normpath(project_path)
-        
-        if not os.path.exists(project_path):
-            return f"Error: Project path '{project_path}' does not exist."
-        
-        if not os.path.isdir(project_path):
-            return f"Error: '{project_path}' is not a directory."
-        
-        # Initialize quality metrics
-        quality_metrics = {
-            "total_lines": 0,
-            "comment_lines": 0,
-            "complex_files": [],
-            "large_files": [],
-            "duplicate_files": [],
-            "potential_issues": []
-        }
-        
-        # File hashes for detecting duplicates
-        file_hashes = {}
-        
-        # Walk through project directory
-        for root, dirs, files in os.walk(project_path):
-            # Skip hidden directories and common build directories
-            dirs[:] = [d for d in dirs if not d.startswith('.') and d not in ['node_modules', '__pycache__', '.git', 'build', 'dist']]
-            
-            for file in files:
-                file_path = os.path.join(root, file)
-                
-                # Skip binary files and non-code files
-                file_ext = os.path.splitext(file)[1].lower()
-                if file_ext not in ['.py', '.js', '.ts', '.java', '.cpp', '.c', '.h', '.cs', '.go', '.rs', '.rb', '.php', '.swift', '.kt', '.scala']:
-                    continue
-                
-                try:
-                    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                        content = f.read()
-                    
-                    # Calculate file hash for duplicate detection
-                    file_hash = hashlib.md5(content.encode()).hexdigest()
-                    if file_hash in file_hashes:
-                        # Found a duplicate
-                        duplicate_path = file_hashes[file_hash]
-                        quality_metrics["duplicate_files"].append((file_path, duplicate_path))
-                    else:
-                        file_hashes[file_hash] = file_path
-                    
-                    # Count lines
-                    lines = content.split('\n')
-                    line_count = len(lines)
-                    quality_metrics["total_lines"] += line_count
-                    
-                    # Count comment lines
-                    comment_count = 0
-                    for line in lines:
-                        stripped = line.strip()
-                        if stripped.startswith('#') or stripped.startswith('//') or stripped.startswith('/*') or stripped.startswith('*') or stripped.startswith('"""'):
-                            comment_count += 1
-                    
-                    quality_metrics["comment_lines"] += comment_count
-                    
-                    # Check for large files (> 500 lines)
-                    if line_count > 500:
-                        quality_metrics["large_files"].append((file_path, line_count))
-                    
-                    # Check for complex files (simplified heuristic)
-                    # Count control structures
-                    control_structures = re.findall(r'\b(if|else|for|while|switch|case|try|catch|except|finally)\b', content)
-                    if len(control_structures) > 20:
-                        quality_metrics["complex_files"].append((file_path, len(control_structures)))
-                    
-                    # Check for potential issues
-                    issues = []
-                    
-                    # Check for TODO comments
-                    todos = re.findall(r'TODO|FIXME|XXX|HACK', content, re.IGNORECASE)
-                    if todos:
-                        issues.append(f"Found {len(todos)} TODO/FIXME comments")
-                    
-                    # Check for long lines (> 100 characters)
-                    long_lines = [line for line in lines if len(line) > 100]
-                    if long_lines:
-                        issues.append(f"Found {len(long_lines)} lines longer than 100 characters")
-                    
-                    # Check for potential security issues (simplified)
-                    if re.search(r'password\s*=\s*[\"\'][^\"\']+[\"\']', content, re.IGNORECASE):
-                        issues.append("Potential hardcoded password found")
-                    
-                    if issues:
-                        quality_metrics["potential_issues"].append((file_path, issues))
-                
-                except Exception as e:
-                    console.print(f"[yellow]Warning: Could not analyze file {file_path}: {str(e)}[/yellow]")
-        
-        # Calculate comment ratio
-        if quality_metrics["total_lines"] > 0:
-            comment_ratio = quality_metrics["comment_lines"] / quality_metrics["total_lines"]
-            quality_metrics["comment_ratio"] = comment_ratio
-        else:
-            quality_metrics["comment_ratio"] = 0
-        
-        # Update analysis state
-        if analysis_state.get("project_analysis"):
-            analysis_state["project_analysis"].quality_metrics = quality_metrics
-        else:
-            analysis_state["project_analysis"] = ProjectAnalysis(
-                project_path=project_path,
-                files_analyzed=[],
-                dependencies={},
-                structure={},
-                quality_metrics=quality_metrics,
-                suggestions=[]
-            )
-        
-        return f"Analyzed code quality: {quality_metrics['total_lines']} lines of code, {quality_metrics['comment_ratio']:.2%} comments"
+    for op in token_usage["operations"]:
+        table.add_row(op["operation"], str(op["tokens"]), op["timestamp"])
     
-    except Exception as e:
-        error_msg = f"Error analyzing code quality: {str(e)}"
-        console.print(f"[red]{error_msg}[/red]")
-        return error_msg
+    table.add_row("TOTAL", str(token_usage["total_tokens"]), "")
+    console.print(table)
 
-def generate_project_report(project_path):
-    """Generate a comprehensive project analysis report"""
-    global analysis_state
-    
-    try:
-        project_path = os.path.normpath(project_path)
-        
-        # Run all analyses
-        analyze_project_structure(project_path)
-        analyze_project_dependencies(project_path)
-        analyze_code_quality(project_path)
-        
-        # Get analysis results
-        analysis = analysis_state.get("project_analysis")
-        if not analysis:
-            return "No analysis data available. Please run analysis first."
-        
-        # Generate report
-        report = []
-        report.append(f"# Project Analysis Report: {analysis.project_path}")
-        report.append(f"Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        report.append("")
-        
-        # Structure section
-        report.append("## Project Structure")
-        report.append(f"- Total files: {analysis.structure.get('total_files', 0)}")
-        report.append(f"- Total directories: {len(analysis.structure.get('directories', []))}")
-        report.append(f"- Total size: {analysis.structure.get('total_size', 0) / (1024*1024):.2f} MB")
-        
-        # File types
-        file_types = analysis.structure.get('file_types', {})
-        if file_types:
-            report.append("")
-            report.append("### File Types")
-            for ext, count in sorted(file_types.items(), key=lambda x: x[1], reverse=True)[:10]:
-                report.append(f"- {ext or 'no extension'}: {count} files")
-        
-        # Dependencies section
-        dependencies = analysis.dependencies
-        if dependencies:
-            report.append("")
-            report.append("## Dependencies")
-            for dep_type, deps in dependencies.items():
-                report.append(f"### {dep_type.capitalize()} ({len(deps)} dependencies)")
-                for dep in sorted(deps)[:10]:  # Show top 10
-                    report.append(f"- {dep}")
-                if len(deps) > 10:
-                    report.append(f"- ... and {len(deps) - 10} more")
-        
-        # Quality metrics section
-        quality_metrics = analysis.quality_metrics
-        if quality_metrics:
-            report.append("")
-            report.append("## Code Quality")
-            report.append(f"- Total lines of code: {quality_metrics.get('total_lines', 0)}")
-            report.append(f"- Comment ratio: {quality_metrics.get('comment_ratio', 0):.2%}")
-            
-            # Large files
-            large_files = quality_metrics.get('large_files', [])
-            if large_files:
-                report.append("")
-                report.append("### Large Files (> 500 lines)")
-                for file_path, line_count in sorted(large_files, key=lambda x: x[1], reverse=True)[:5]:
-                    rel_path = os.path.relpath(file_path, project_path)
-                    report.append(f"- {rel_path}: {line_count} lines")
-            
-            # Complex files
-            complex_files = quality_metrics.get('complex_files', [])
-            if complex_files:
-                report.append("")
-                report.append("### Complex Files (> 20 control structures)")
-                for file_path, complexity in sorted(complex_files, key=lambda x: x[1], reverse=True)[:5]:
-                    rel_path = os.path.relpath(file_path, project_path)
-                    report.append(f"- {rel_path}: {complexity} control structures")
-            
-            # Duplicate files
-            duplicate_files = quality_metrics.get('duplicate_files', [])
-            if duplicate_files:
-                report.append("")
-                report.append("### Duplicate Files")
-                for file1, file2 in duplicate_files[:5]:
-                    rel_path1 = os.path.relpath(file1, project_path)
-                    rel_path2 = os.path.relpath(file2, project_path)
-                    report.append(f"- {rel_path1} is identical to {rel_path2}")
-            
-            # Potential issues
-            potential_issues = quality_metrics.get('potential_issues', [])
-            if potential_issues:
-                report.append("")
-                report.append("### Potential Issues")
-                for file_path, issues in potential_issues[:5]:
-                    rel_path = os.path.relpath(file_path, project_path)
-                    report.append(f"- {rel_path}:")
-                    for issue in issues:
-                        report.append(f"  - {issue}")
-        
-        # Suggestions section
-        suggestions = analysis.suggestions
-        if not suggestions:
-            # Generate some basic suggestions based on analysis
-            suggestions = []
-            
-            # Suggest adding documentation if comment ratio is low
-            comment_ratio = quality_metrics.get('comment_ratio', 0)
-            if comment_ratio < 0.1:
-                suggestions.append("Consider adding more comments and documentation to improve code maintainability.")
-            
-            # Suggest refactoring large files
-            large_files = quality_metrics.get('large_files', [])
-            if large_files:
-                suggestions.append(f"Consider refactoring {len(large_files)} large files to improve maintainability.")
-            
-            # Suggest handling duplicate files
-            duplicate_files = quality_metrics.get('duplicate_files', [])
-            if duplicate_files:
-                suggestions.append(f"Consider removing or refactoring {len(duplicate_files)} duplicate files.")
-            
-            # Suggest addressing potential issues
-            potential_issues = quality_metrics.get('potential_issues', [])
-            if potential_issues:
-                suggestions.append(f"Review and address {len(potential_issues)} files with potential issues.")
-        
-        if suggestions:
-            report.append("")
-            report.append("## Suggestions")
-            for suggestion in suggestions:
-                report.append(f"- {suggestion}")
-        
-        # Write report to file
-        report_path = os.path.join(project_path, "osram_analysis_report.md")
-        with open(report_path, 'w', encoding='utf-8') as f:
-            f.write("\n".join(report))
-        
-        return f"Generated project analysis report: {report_path}"
-    
-    except Exception as e:
-        error_msg = f"Error generating project report: {str(e)}"
-        console.print(f"[red]{error_msg}[/red]")
-        return error_msg
-
-# CLI commands
-@click.group()
-@click.version_option(version="1.0.0")
-def cli():
-    """Osram CLI - Multi-provider AI assistant for developers"""
-    console.print(LOGO)
-    console.print("Welcome to Osram CLI - Your AI-powered development assistant")
-
-@cli.command()
-@click.argument('message', required=False)
-@click.option('--provider', '-p', help='Specify provider (zai, claude, gemini, openai, qwen)')
-@click.option('--model', '-m', help='Specify model')
-def chat(message, provider, model):
-    """Chat with AI assistant"""
-    config = load_config()
-    
-    # Use current provider if not specified
-    if not provider:
-        provider = config.get("current_provider", "zai")
-    
-    # Check if provider is configured
-    if provider not in config["providers"]:
-        console.print(f"[red]Provider '{provider}' not configured[/red]")
-        return
-    
-    provider_config = config["providers"][provider]
-    
-    # Check if API key is set
-    if not provider_config.get("api_key"):
-        console.print(f"[red]API key not configured for provider '{provider}'[/red]")
-        console.print(f"[yellow]Run 'osram config' to set up your API key[/yellow]")
-        return
-    
-    # Use current model if not specified
-    if not model:
-        model = provider_config.get("model")
-    
-    # Start chat
-    if message:
-        # Single message mode
-        messages = [{"role": "user", "content": message}]
-        
-        console.print(f"[bold green]You:[/bold green] {message}")
-        console.print("[bold blue]AI:[/bold blue] ", end="")
-        
-        response_stream = call_api(messages, provider, model)
-        if response_stream:
-            response_text = ""
-            for chunk in response_stream:
-                console.print(chunk, end="")
-                response_text += chunk
-            console.print()
-        else:
-            console.print("[red]Failed to get response from AI[/red]")
-    else:
-        # Interactive mode
-        console.print("[bold green]Interactive chat mode (type 'exit' to quit)[/bold green]")
-        
-        messages = []
-        
-        while True:
-            try:
-                user_input = prompt("\n[You] ", history=FileHistory(os.path.expanduser("~/.osram_history.json")))
-                
-                if user_input.lower() in ['exit', 'quit']:
-                    break
-                
-                if not user_input.strip():
-                    continue
-                
-                messages.append({"role": "user", "content": user_input})
-                
-                console.print("[bold blue]AI:[/bold blue] ", end="")
-                
-                response_stream = call_api(messages, provider, model)
-                if response_stream:
-                    response_text = ""
-                    for chunk in response_stream:
-                        console.print(chunk, end="")
-                        response_text += chunk
-                    console.print()
-                    
-                    # Add assistant response to history
-                    messages.append({"role": "assistant", "content": response_text})
-                else:
-                    console.print("[red]Failed to get response from AI[/red]")
-            
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Interrupted by user[/yellow]")
-                break
-            except Exception as e:
-                console.print(f"[red]Error: {str(e)}[/red]")
-
-@cli.command()
-@click.option('--provider', '-p', help='Provider to switch to')
-@click.option('--model', '-m', help='Model to switch to')
-def switch(provider, model):
-    """Switch AI provider or model"""
-    if not provider and not model:
-        console.print("[yellow]Please specify a provider or model to switch to[/yellow]")
-        console.print("Example: osram switch --provider claude")
-        console.print("Example: osram switch --model gpt-4")
-        return
-    
-    success = switch_provider(provider, model)
-    if success:
-        console.print("[green]Switch successful[/green]")
-    else:
-        console.print("[red]Switch failed[/red]")
-
-@cli.command()
-def list():
-    """List available providers"""
-    list_providers()
-
-@cli.command()
-@click.argument('path', default='.')
-def analyze(path):
-    """Analyze project structure, dependencies, and code quality"""
-    console.print(f"[bold]Analyzing project: {path}[/bold]")
-    
-    # Run all analyses
-    structure_result = analyze_project_structure(path)
-    console.print(f"[green]{structure_result}[/green]")
-    
-    dependencies_result = analyze_project_dependencies(path)
-    console.print(f"[green]{dependencies_result}[/green]")
-    
-    quality_result = analyze_code_quality(path)
-    console.print(f"[green]{quality_result}[/green]")
-    
-    # Generate report
-    report_result = generate_project_report(path)
-    console.print(f"[green]{report_result}[/green]")
-
-@cli.command()
-def config():
-    """Edit configuration"""
-    config_path = Path.home() / ".osram_config.json"
-    
-    if not config_path.exists():
-        console.print("[yellow]Configuration file not found. Creating default configuration...[/yellow]")
-        load_config()
-    
-    console.print(f"[bold]Opening configuration file: {config_path}[/bold]")
-    
-    # Try to open with default editor
-    try:
-        if platform.system() == "Windows":
-            os.startfile(config_path)
-        elif platform.system() == "Darwin":  # macOS
-            subprocess.run(["open", str(config_path)])
-        else:  # Linux
-            subprocess.run(["xdg-open", str(config_path)])
-    except Exception as e:
-        console.print(f"[red]Could not open configuration file: {str(e)}[/red]")
-        console.print(f"[yellow]Please manually edit: {config_path}[/yellow]")
-
-@cli.command()
-@click.argument('path', default='.')
-def report(path):
-    """Generate project analysis report"""
-    result = generate_project_report(path)
-    console.print(result)
-
-@cli.command()
-@click.argument('path', default='.')
-def ls(path):
-    """List directory contents"""
-    result = list_directory_contents(path)
-    console.print(result)
-
-@cli.command()
-@click.argument('file_path')
-def read(file_path):
-    """Read file content"""
-    result = read_file_content(file_path)
-    console.print(result)
-
-@cli.command()
-@click.argument('file_path')
-@click.argument('content')
-def write(file_path, content):
-    """Write content to file"""
-    result = write_file_content(file_path, content)
-    console.print(result)
-
-@cli.command()
-@click.argument('dir_path')
-def mkdir(dir_path):
-    """Create directory"""
-    result = create_directory(dir_path)
-    console.print(result)
-
-@cli.command()
-@click.argument('path')
-def rm(path):
-    """Delete file or directory"""
-    result = delete_file_or_path(path)
-    console.print(result)
-
-@cli.command()
-@click.argument('source')
-@click.argument('destination')
-def cp(source, destination):
-    """Copy file or directory"""
-    result = copy_file(source, destination)
-    console.print(result)
-
-@cli.command()
-@click.argument('source')
-@click.argument('destination')
-def mv(source, destination):
-    """Move file or directory"""
-    result = move_file(source, destination)
-    console.print(result)
-
-@cli.command()
-@click.argument('old_path')
-@click.argument('new_name')
-def rename(old_path, new_name):
-    """Rename file or directory"""
-    result = rename_file(old_path, new_name)
-    console.print(result)
-
-@cli.command()
-@click.argument('pattern')
-@click.option('--directory', '-d', default='.', help='Directory to search in')
-def find(pattern, directory):
-    """Find files matching pattern"""
-    result = find_files(pattern, directory)
-    console.print(result)
-
-@cli.command()
-@click.argument('file1')
-@click.argument('file2')
-def diff(file1, file2):
-    """Compare two files"""
-    result = compare_files(file1, file2)
-    console.print(result)
-
-@cli.command()
-@click.argument('path')
-def cd(path):
-    """Change directory"""
-    result = change_directory(path)
-    console.print(result)
-
-@cli.command()
-def pwd():
-    """Print current directory"""
-    result = get_current_directory()
-    console.print(result)
-
-@cli.command()
-@click.argument('command')
-def shell(command):
-    """Execute shell command"""
-    result = execute_shell_command(command)
-    console.print(result)
-
-@cli.command()
-@click.argument('operation')
-@click.argument('args', nargs=-1)
-def git(operation, args):
-    """Execute git operation"""
-    result = git_operation(operation, *args)
-    console.print(result)
-
-if __name__ == "__main__":
-    cli()
+def estimate_tokens(text):
+    """Estimate the number of tokens in a text"""
+    return len(text) // 4 + (1 if len(text) % 4 > 0 else 0)
